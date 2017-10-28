@@ -1,0 +1,588 @@
+#!/bin/sh
+# Dopisac licencje
+
+print() {
+    echo -e "$@"
+}
+
+print_info() {
+    print "Info: $@"
+}
+
+print_error() {
+    print "Error: $@"
+}
+
+prepare_key() {
+    print_info "A key is generating."
+    dd if=/dev/urandom of=.key bs=1024 count=2
+}
+
+prepare_header() {
+    print_info "A header file is generating."
+    dd if=/dev/zero of=.header bs=1M count=2
+}
+
+cryptrootfsformat() {
+    local device="$1"
+    local offset="$2"
+    [ $offset -le 0 ] ||
+    let ++offset
+
+    local status=1
+    while [ "$status" = '1' ]; do
+        print_info "Cryptsetup is formatting a root volume."
+        if [ $offset == 0 ]; then
+            cryptsetup luksFormat "$device" --key-file .key --header .header
+        else
+            cryptsetup luksFormat "$device" --key-file .key --header .header --align-payload=$offset
+        fi
+        status=$?
+    done
+}
+
+cryptrootfsopen() {
+    local device="$1"
+    local mapdevice="$2"
+
+    local status=1
+    while [ "$status" = '1' ]; do
+        print_info "Cryptsetup is opening a root volume."
+        cryptsetup luksOpen "$device" "$mapdevice" --key-file .key --header .header
+        status=$?
+    done
+}
+
+mkfs() {
+    local device="$1"
+    local filesystem="$2"
+    local cmd="mkfs.$filesystem"
+
+    print_info "Make filesystem $filesystem on device $device."
+    eval $cmd "$device"
+}
+
+cryptbootaddkey() {
+    local device="$1"
+
+    local status=1
+    while [ "$status" = '1' ]; do
+        print_info "Cryptsetup is adding a key to boot volume $device."
+        cryptsetup luksAddKey "$1" .key
+        status=$?
+    done
+}
+
+is_mountpoint() {
+    mount | grep -qE "[[:space:]]+on[[:space:]]+$1[[:space:]]+"
+}
+
+
+mount_fs() {
+    is_mountpoint "$1" || mount -t $2 none "$1"
+}
+
+umount_fs() {
+    ! is_mountpoint "$1" || umount "$1"
+}
+
+mount_all_fs() {
+    is_mountpoint "/target" || return 1
+    mount_fs "/target/proc" proc
+    mount_fs "/target/sys" sysfs
+    mount_fs "/target/dev" devtmpfs
+    mount_fs "/target/dev/pts" devpts
+}
+
+umount_all_fs() {
+    umount_fs "/target/proc"
+    umount_fs "/target/sysfs"
+    umount_fs "/target/dev"
+    umount_fs "/target/dev/pts"
+}
+
+move_security_files() {
+    mv -fv .key .header /target/boot/
+    ln -Tfs /boot/.key /target/etc/.key
+    ln -Tfs /boot/.header /target/etc/.header
+}
+
+print_crypttab() {
+    local target="/target/etc/initramfs-tools/conf.d"
+
+    [ -e "$target" ] || return 1
+    print_info "A crypttab is cleaning."
+    echo "# <target name> <source device>  <key file>        <options>" > /target/etc/crypttab
+    echo "A cryptsetup is preparing."
+    echo 'export CRYPTSETUP=y' > "$target/cryptsetup"
+}
+
+print_hook_key() {
+    local file='/target/etc/initramfs-tools/hooks/key'
+    print_info "A hook for initramfs is creating."
+    cat <<END >"$file"
+#!/bin/sh
+
+set -e
+
+PREREQ=""
+
+prereqs()
+{
+    echo "\$PREREQ"
+}
+
+case "\$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+fkey="\`/bin/readlink -f /etc/.key\`"
+fheader="\`/bin/readlink -f /etc/.header\`"
+
+if [ -f "\$fkey" ] && [ -f "\$fheader" ]
+then
+    copy_file 'test' "\$fkey" /etc
+    copy_file 'test' "\$fheader" /etc
+    copy_exec /usr/bin/shred /bin
+    LIBC_DIR=\$(ldd /usr/bin/shred | sed -nr 's#.* => (/lib.*)/libc\.so\.[0-9.-]+ \(0x[[:xdigit:]]+\)\$#\1#p')
+    find -L "\$LIBC_DIR" -maxdepth 1 -name 'libgcc_s.*' -type f | while read so; do
+        copy_exec "\$so"
+    done
+fi
+END
+    chmod +x "$file"
+}
+
+print_local_bottom_key() {
+    local file='/target/etc/initramfs-tools/scripts/local-bottom/key'
+    print_info "A script for initramfs is creating."
+    cat <<END >"$file"
+#!/bin/sh
+
+set -e
+PREREQ=""
+
+prereqs()
+{
+    echo "\$PREREQ"
+}
+
+case \$1 in
+    prereqs)
+       exit 0
+       ;;
+esac
+
+# source for log_*_msg() functions, see LP: #272301
+. /scripts/functions
+
+shred -uz /etc/.key
+shred -uz /etc/.header
+
+exit 0
+END
+    chmod +x "$file"
+}
+
+findDiskId() {
+    local device="$1"
+    local file
+
+    for file in /dev/disk/by-id/*; do
+        [ "`readlink -f $file`" = "$device"  ] &&
+        echo "$file" &&
+        break
+    done
+}
+
+print_default_grub() {
+    local boot="$1"
+    local target="$2"
+    local device="`findDiskId $3`"
+
+    sed -i -re '/^GRUB_CMDLINE_LINUX=/d' /target/etc/default/grub &&
+    echo "GRUB_CMDLINE_LINUX=\"cryptdevice=$boot:ext2 cryptopts=target=$target,source=$device,keyscript=/bin/cat,tries=5,key=/etc/.key,header=/etc/.header\"" >> /target/etc/default/grub
+    sed -i -re '/^GRUB_ENABLE_CRYPTODISK=/d' /target/etc/default/grub &&
+    echo "GRUB_ENABLE_CRYPTODISK=y" >> /target/etc/default/grub
+
+}
+
+print_40_custom() {
+    local uuid="$1"
+
+    print_info "An item of grub menu is creating."
+    cat <<END >/target/etc/grub.d/40_custom
+#!/bin/sh
+exec tail -n +3 \$0
+# This file provides an easy way to add custom menu entries.  Simply type the
+# menu entries you want to add after this comment.  Be careful not to change
+# the 'exec tail' line above.
+
+menuentry 'Install Ubuntu' {
+    recordfail
+    load_video
+    gfxmode \$linux_gfx_mode
+    insmod gzio
+    if [ x\$grub_platform = xxen ]; then insmod xzio; insmod lzopio; fi
+    insmod part_msdos
+    insmod cryptodisk
+    insmod luks
+    insmod gcry_rijndael
+    insmod gcry_sha256
+    insmod ext2
+    cryptomount -u $uuid
+    linux   /install/linux tasks=standard pkgsel/language-pack-patterns= pkgsel/install-language-support=false priority=low vga=788 initrd=initrd.gz ---
+    initrd  /install/initrd.gz
+}
+END
+}
+
+print_fstab() {
+    local bootdevice="$1"
+    print_info "fstab is preparing."
+    export `blkid -o export "$bootdevice"`
+    sed -i -re "s:^(UUID=)([^[:space:]]+)([[:space:]]+/boot[[:space:]]+[^[:space:]]+[[:space:]]+)([^[:space:]]+)([[:space:]]+.*)$:\1$UUID\3noauto,\4\5:" /target/etc/fstab
+}
+
+print_all_files() {
+    local boottarget="$1"
+    local btarget="$2"
+    local rootdevice="$3"
+    local roottarget="$4"
+    local rtarget="/dev/mapper/$roottarget"
+
+    print_info "Configuring system."
+    print_local_bottom_key &&
+    print_hook_key &&
+    print_crypttab &&
+    print_default_grub "$boottarget" "$roottarget" "$rootdevice" &&
+    print_fstab "$btarget"
+    print_fstab "$rtarget"
+}
+
+exec_in_chroot() {
+    print_info "Configuring boot manager and generating initramfs."
+    chroot /target /bin/bash -c "update-grub2 && update-initramfs -u && grub-install $1"
+}
+
+get_cdrom_device() {
+    local file
+    local result=1
+
+    for file in /dev/disk/by-id/*; do
+        test "`/bin/block-attr --type $file`" == "iso9660" &&
+        /bin/readlink -f "$file" &&
+        result=0 &&
+        break
+    done
+
+    return $result
+}
+
+copy_install_system() {
+    local result=0
+
+    print_info "Copying installation system at boot partition."
+    local devcdrom=`get_cdrom_device` &&
+    mount -t iso9660 -o rw $devcdrom /mnt &&
+    mkdir -v /target/boot/install &&
+    cp -av /mnt/linux /target/boot/install/ &&
+    cp -av /mnt/initrd.gz /target/boot/install/ ||
+    result=1
+
+    is_mountpoint /mnt &&
+    umount -v /mnt
+
+    return $result
+}
+
+get_uuid_of_device() {
+    ( export `blkid -o export "$1"`; echo $UUID;  )
+}
+
+save_booting_files() {
+    local archive="`mktemp`.tar"
+
+    tar -cf "$archive" /target/boot/ &&
+    echo "$archive"
+}
+
+restore_booting_files() {
+    local archive="$1"
+    print_info "Restoring content of boot partition."
+    tar -xf "$archive" -C /
+}
+
+cryptbootfsformat() {
+    local device="$1"
+
+    local status=1
+    while [ "$status" = '1' ]; do
+        print_info "Cryptsetup is formatting a boot volume."
+        cryptsetup luksFormat "$device"
+        status=$?
+    done
+}
+
+cryptbootfsopen() {
+    local device="$1"
+    local mapdevice="$2"
+
+    local status=1
+    while [ "$status" = '1' ]; do
+        print_info "Cryptsetup is opening a boot volume."
+        cryptsetup luksOpen "$device" "$mapdevice"
+        status=$?
+    done
+}
+
+prepare_cryptroot() {
+    local device="$1"
+    local filesystem="$2"
+    local partition="$3"
+    local offset=0
+    [ -z "$partition" ] ||
+    offset=`get_offset "$partition"`
+    local target="system"
+
+    print_info "A root volume is preparing."
+    prepare_key &&
+    prepare_header &&
+    cryptrootfsformat "$device" "$offset" &&
+    cryptrootfsopen "$device" "$target" &&
+    mkfs "/dev/mapper/$target" "$filesystem"
+}
+
+extract_device_name() {
+    echo $1 | sed -re 's/[[:digit:]]+//g'
+}
+
+get_offset() {
+    local partition="$1"
+    local device="`extract_device_name ${partition}`"
+
+    fdisk --bytes -l "$device" -o Device,End | sed -rne "/^$(echo $partition | sed -re 's:/:\\/:g')/s/^.*[[:space:]]+([[:digit:]]+)$/\1/p"
+}
+
+prepare_security_system() {
+    local bootdevice="$1"
+    local rootdevice="$2"
+    local btarget="boot"
+    local boottarget="/dev/mapper/$btarget"
+    local roottarget="system"
+    local bdevice=`extract_device_name ${bootdevice}`
+
+    print_info "Preparing luks security system."
+    print_info "Saving content of boot partition."
+    local archive=`save_booting_files` &&
+    umount_fs "/target/boot" &&
+    cryptbootfsformat "$bootdevice" &&
+    cryptbootaddkey "$bootdevice" &&
+    cryptbootfsopen "$bootdevice" "$btarget" &&
+    mkfs "$boottarget" "ext2" &&
+    mount -t ext2 "$boottarget" "/target/boot" &&
+    restore_booting_files "$archive" &&
+    move_security_files &&
+    print_all_files "$bdevice" "$boottarget" "$rootdevice" "$roottarget" &&
+    mount_all_fs &&
+    exec_in_chroot "$bdevice" ||
+    return 1
+}
+
+prepare_mini_install() {
+    local device="$1"
+    local btarget="${bootdevice#/dev/}_crypt"
+    local boottarget="/dev/mapper/$btarget"
+    local bdevice
+
+    print_info "Preparing mini-installation system on boot volume."
+    if copy_install_system &&
+        uuid=`get_uuid_of_device "$boottarget"` &&
+        print_40_custom "$uuid" &&
+        mount_all_fs
+    then
+        bdevice=`extract_device_name $device` &&
+        exec_in_chroot "$bdevice"
+    else
+        return 1
+    fi
+}
+
+check_stage_order() {
+    [ $1 != 0 ] &&
+    print_info "Checking a stage order." ||
+    return 1
+
+    case $1 in
+        1)  if [ -f .stage1 ]; then
+                print_error "Stage1 został już wykonany!\n"
+                return 1
+            fi
+            ;;
+        2)  if [ -f .stage2 ]; then
+                print_error "Stage2 został już wykonany!\n"
+                return 1
+            fi
+            [ -f .stage1 -a ! -f .stage2 ]
+            ;;
+        3)  if [ -f .mini ]; then
+                print_error "Stage mini został już wykonany!\n"
+                return 1
+            fi
+            [ -f .stage1 -a ! -f .mini ]
+            ;;
+    esac
+}
+
+is_block_device() {
+    [ -b "$1" ]
+}
+
+verify_filesystem_parameter() {
+    local stage=$1
+    local filesystem="$2"
+
+    print_info "Verifying filesystem parameters."
+    [ $stage -eq 1 -o $stage -eq 2 ] ||
+    return 0
+
+    case "$filesystem" in
+      ext2|ext3|ext4|xfs|xfs|btrfs);;
+      '')
+        print_error "Stage 1 i 2 wymaga podania nazwy filesystemu!\n"
+        return 1;;
+      *)
+        print_error "Nieznany system plików!\n"
+        return 2;;
+    esac
+}
+
+verify_stage_parameters() {
+    local stage=$1
+    local bootdevice="$2"
+    local rootdevice="$3"
+    local filesystem="$4"
+    local partition="$5"
+
+    print_info "Verifying stage parameters."
+    if [ $stage -eq 1 ]; then
+        if [ -z "$rootdevice" ]; then
+            print_error "Stage1 wymaga podania parametru -r!\n"
+            return 1
+        fi
+        if [ -n "$partition" ]; then
+            if is_block_device "$partition"; then
+                print_error "Wartość parametru install-after powinna wskazywać na partycję!\n"
+                return 2
+            fi
+        fi
+        is_block_device "$rootdevice"
+    elif [ $stage -eq 2 ]; then
+        if [ -z "$bootdevice" -o -z "$rootdevice" ]; then
+            print_error "Stage2 wymaga podania parametru -b oraz -r!\n"
+            return 3
+        fi
+        is_block_device "$bootdevice" &&
+        is_block_device "$rootdevice"
+    fi
+    if [ $? -ne 0 ]; then
+        print_error "Nie podano prawidłowych urządzeń dyskowych!\n"
+        return 4
+    fi
+    verify_filesystem_parameter "$stage" "$filesystem"
+}
+
+exec_stage() {
+    local stage=$1
+    local bootdevice="$2"
+    local rootdevice="$3"
+    local filesystem="$4"
+    local partition="$5"
+
+    print_info "Executing a stage."
+    case $stage in
+        0) return 1;;
+        1) [ -f .stage1 ] && return 2
+           prepare_cryptroot "$rootdevice" "$filesystem" "$partition" &&
+           touch .stage1
+           ;;
+        2) [ -f .stage2 ] && return 3
+           prepare_security_system "$bootdevice" "$rootdevice" &&
+           touch .stage2
+           ;;
+        3) [ -f .mini ] && return 4
+           prepare_mini_install "$bootdevice" &&
+           touch .mini
+           ;;
+    esac
+}
+
+help_pl() {
+    print "cryptboot (ver. 0.1) --stage1|--stage2|--mini -b BOOT_DEVICE -r ROOT_DEVICE -f [ext2|ext3|ext4|jfs,xfs,btrfs] --install-after BOOT_PARTITION\n"
+    print "UWAGA:"
+    print "Nie używaj tego narzędzia, jeśli nie jesteś pewien tego co robisz, ponieważ możesz utracić danego na dysku.\n"
+    print "Program współdziała z instalatorem Ubuntu 17.04 mini w trybie expert w celu"
+    print "instalacji systemu na zaszyfrowanym systemie plikowym z odłączonym nagłowkiem luks oraz kluczem.\n"
+    print "Są możliwe dwa scenariusze użycia:"
+    print " - zaszyfrowanie całego dysku stacjonarnego,"
+    print " - zaszyfrowanie bloku dysku stacjonarnego, zaczynającego się za podaną partycją."
+    print "Oba przypadki obejmują następujące kroki:"
+    print " - utworzenie na nośniku mobilnym, np: pendrive, zaszyfrowanej hasłem partycji bootowania"
+    print "   z systemem plikowym ext2,"
+    print " - utworzenie zaszyfrowanego dysku stacjonarnego z wybranym systemem plikowym, którego nagłówki luks"
+    print "   oraz klucz jest przechowywany na nośniku mobilnym.\n"
+    print "W prawidłowymy wykonaniu etapów instalacji należy zapoznać się z filmem instruktażowym @link"
+}
+
+help() {
+    local func="help_$LANGUAGE"
+    type "$func" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        eval $func
+    else
+        #print_error "Language '$LANGUAGE' is not supported!"
+        help_pl
+    fi
+}
+
+detect_stage() {
+    [ ! -f .stage1 -a ! -f .stage2 ] && return 1
+    [ -f .stage1 -a ! -f .stage2 ] && return 2
+    [ -f .stage1 -a -f .stage2 ] && return 3
+    return 0
+}
+
+main() {
+    local bootdevice rootdevice filesystem partition
+    detect_stage
+    local stage=$?
+    local getopts=`getopt -o b:r:f: --long stage1,stage2,mini,install-after: -n 'cryptoboot' -- $@`
+
+    [ $? == 0 ] || exit 1
+    eval set -- "$getopts"
+    while true; do
+        case $1 in
+          -b) bootdevice="$2"; shift 2;;
+          -r) rootdevice="$2"; shift 2;;
+          -f) filesystem="$2"; shift 2;;
+          --stage1) stage=1; shift;;
+          --stage2) stage=2; shift;;
+          --mini) stage=3; shift;;
+          --install-after) partition="$2"; shift 2;;
+          --) shift; break;;
+          *) help; exit 1;;
+        esac
+    done
+
+    check_stage_order $stage || { help; exit 2; }
+    verify_stage_parameters "$stage" "$bootdevice" "$rootdevice" "$filesystem" || { help; exit 3; }
+    exec_stage $stage "$bootdevice" "$rootdevice" "$filesystem" "$partition" || { help; exit 4; }
+}
+
+main "$@"
+
