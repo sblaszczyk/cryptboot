@@ -20,7 +20,7 @@ wget http://archive.ubuntu.com/ubuntu/dists/zesty/main/installer-amd64/current/i
 
 ### Instalacja
 
-Przebieg instalacji jest zaprezentowany w filmie instruktażowym @link.
+Przebieg instalacji jest zaprezentowany w filmie instruktażowym https://youtu.be/CN94RTiUA-o.
 
 ## Autorzy
 
