@@ -28,7 +28,7 @@ Przebieg instalacji jest zaprezentowany w filmie instruktażowym @link.
 
 ## Licencja
 
-Ten projekt jest objęty licencją MIT - szczegóły [LICENSE.md](LICENSE.md)
+Ten projekt jest objęty licencją MIT - szczegóły [LICENSE](LICENSE)
 
 ## Podziękowania
 
