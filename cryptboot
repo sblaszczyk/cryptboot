@@ -581,6 +581,7 @@ main() {
 
     check_stage_order $stage || { help; exit 2; }
     verify_stage_parameters "$stage" "$bootdevice" "$rootdevice" "$filesystem" || { help; exit 3; }
+    modprobe loop &&
     exec_stage $stage "$bootdevice" "$rootdevice" "$filesystem" "$partition" || { help; exit 4; }
 }
 
